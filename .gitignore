@@ -1,0 +1,8 @@
+# Generated per user by the OBS script
+nico-config.js
+youtube-chat.log
+
+# Release builds and clips
+*.zip
+*.mp4
+*.mkv

@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Nico Comments Overlay</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: transparent; width: 100%; height: 100%; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #post {
+    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);
+    width: min(720px, 90vw); display: none; gap: 8px;
+    background: rgba(0,0,0,.75); padding: 8px; border-radius: 6px; border: 1px solid #555;
+    font: 14px "Yu Gothic", Meiryo, sans-serif; color: #fff;
+  }
+  #post.open { display: flex; }
+  #post input { background: #111; color: #fff; border: 1px solid #444; padding: 6px 8px; font: inherit; }
+  #post #cmd { width: 140px; }
+  #post #txt { flex: 1; }
+</style>
+<!-- Written by nico-comments.lua (optional). Missing file is fine. -->
+<script src="nico-config.js"></script>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="post">
+  <input id="cmd" placeholder="big red ue" title="Commands: big/medium/small, ue/shita/naka, colour name or #RRGGBB, @seconds">
+  <input id="txt" placeholder="コメントを入力 (Enter to send, Esc to close)">
+</div>
+<script>
+(() => {
+'use strict';
+
+/* ------------------------------------------------------------------ *
+ * Config: defaults  <  window.NICO_CONFIG (nico-config.js)  <  URL ?params
+ * ------------------------------------------------------------------ */
+const DEFAULTS = {
+  demo: true,            // generate fake comments
+  demoRate: 4,           // demo comments per second (average)
+  demoBursts: true,      // occasional "8888" / "wwww" hype waves
+  twitch: '',            // Twitch channel name to read chat from (anonymous, no login)
+  youtube: '',           // YouTube channel/video; chat arrives via youtube-chat.ps1 (started by the OBS script)
+  youtubePort: 39391,
+  kick: '',              // Kick channel name (or numeric chatroom id) to read chat from
+  ws: '',                // custom WebSocket URL (text or JSON {text, commands})
+  duration: 4,           // seconds for a scrolling comment to cross the screen (Niconico = 4)
+  fixedDuration: 3,      // seconds ue/shita comments stay (Niconico = 3)
+  scale: 1,              // overall text size multiplier
+  bigPct: 15,            // % of comments randomly made "big"
+  smallPct: 15,          // % of comments randomly made "small"
+  jitter: 20,            // ± random size variation per comment, in %
+  colorPct: 8,           // % of comments given a random Niconico colour
+  fixedPct: 4,           // % of comments randomly placed ue (top) / shita (bottom)
+  opacity: 100,          // %
+  outline: 1,            // outline thickness multiplier (0 = none)
+  font: '"MS PGothic","ＭＳ Ｐゴシック","Hiragino Kaku Gothic ProN","Noto Sans JP","Yu Gothic",Meiryo,sans-serif',
+  bold: true,
+  viewerCommands: true,  // let chat type "[big red ue] text"
+  ignoreUsers: 'nightbot,streamelements,streamlabs,moobot,fossabot',
+  maxChars: 100,
+  maxComments: 200,      // safety cap on simultaneous comments
+};
+
+const cfg = Object.assign({}, DEFAULTS, window.NICO_CONFIG || {});
+for (const [k, v] of new URLSearchParams(location.search)) {
+  if (!(k in DEFAULTS)) continue;
+  const d = DEFAULTS[k];
+  cfg[k] = typeof d === 'boolean' ? /^(1|true|yes|on)$/i.test(v)
+         : typeof d === 'number'  ? (isFinite(+v) ? +v : d)
+         : v;
+}
+const ignored = new Set(String(cfg.ignoreUsers).toLowerCase().split(/[\s,]+/).filter(Boolean));
+
+/* ------------------------------------------------------------------ *
+ * Niconico comment vocabulary
+ * ------------------------------------------------------------------ */
+// Font size as a fraction of stage height (original player: 39/24/15px on a 384px stage)
+const SIZES = { big: 39 / 384, medium: 24 / 384, small: 15 / 384 };
+const COLORS = {
+  white: '#FFFFFF', red: '#FF0000', pink: '#FF8080', orange: '#FFC000', yellow: '#FFFF00',
+  green: '#00FF00', cyan: '#00FFFF', blue: '#0000FF', purple: '#C000FF', black: '#000000',
+  white2: '#CCCC99', niconicowhite: '#CCCC99', red2: '#CC0033', truered: '#CC0033',
+  pink2: '#FF33CC', orange2: '#FF6600', passionorange: '#FF6600', yellow2: '#999900',
+  madyellow: '#999900', green2: '#00CC66', elementalgreen: '#00CC66', cyan2: '#00CCCC',
+  blue2: '#3399FF', marineblue: '#3399FF', purple2: '#6633CC', nobleviolet: '#6633CC', black2: '#666666',
+};
+// Colours used when randomly tinting comments (the bright, readable ones)
+const RANDOM_COLORS = ['red', 'pink', 'orange', 'yellow', 'green', 'cyan', 'blue', 'purple', 'pink2', 'orange2', 'blue2'];
+
+function parseCommands(str) {
+  const out = {};
+  for (const tok of String(str || '').toLowerCase().split(/\s+/).filter(Boolean)) {
+    if (tok in SIZES) out.size = tok;
+    else if (tok === 'ue' || tok === 'shita' || tok === 'naka') out.pos = tok;
+    else if (tok in COLORS) out.color = COLORS[tok];
+    else if (/^#[0-9a-f]{6}$/.test(tok)) out.color = tok;
+    else if (/^@\d+(\.\d+)?$/.test(tok)) out.dur = Math.min(30, +tok.slice(1));
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Stage
+ * ------------------------------------------------------------------ */
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const active = { naka: [], ue: [], shita: [] };
+const rand = (a, b) => a + Math.random() * (b - a);
+const chance = pct => Math.random() * 100 < pct;
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+
+// Render a comment's text once into its own bitmap; per-frame we only blit it.
+function renderBitmap(lines, fontPx, color) {
+  const font = `${cfg.bold ? 'bold ' : ''}${fontPx}px ${cfg.font}`;
+  ctx.font = font;
+  const lineH = Math.round(fontPx * 1.17);
+  const stroke = Math.max(0, fontPx * 0.09 * cfg.outline);
+  const pad = Math.ceil(stroke) + 2;
+  const textW = Math.max(1, ...lines.map(l => ctx.measureText(l).width));
+  const w = Math.ceil(textW + pad * 2), h = Math.ceil(lineH * lines.length + pad * 2);
+
+  const c = document.createElement('canvas');
+  c.width = Math.ceil(w * dpr); c.height = Math.ceil(h * dpr);
+  const g = c.getContext('2d');
+  g.scale(dpr, dpr);
+  g.font = font;
+  g.textBaseline = 'middle';
+  g.lineJoin = 'round';
+  g.miterLimit = 2;
+  const isDark = color === '#000000' || color === '#666666';
+  lines.forEach((line, i) => {
+    const y = pad + lineH * (i + 0.5);
+    if (stroke > 0) {
+      g.strokeStyle = isDark ? 'rgba(255,255,255,0.85)' : 'rgba(0,0,0,0.85)';
+      g.lineWidth = stroke;
+      g.strokeText(line, pad, y);
+    }
+    g.fillStyle = color;
+    g.fillText(line, pad, y);
+  });
+  return { bmp: c, w, h };
+}
+
+function totalCount() { return active.naka.length + active.ue.length + active.shita.length; }
+
+/* Add a comment. `commands` is a Niconico-style mail string, e.g. "big red ue". */
+function addComment(text, commands = '', { randomize = true } = {}) {
+  text = String(text || '').replace(/\r/g, '').replace(/\t/g, ' ').trim();
+  if (!text) return;
+  if (text.length > cfg.maxChars) text = text.slice(0, cfg.maxChars) + '…';
+  if (totalCount() >= cfg.maxComments) return;
+
+  const cmd = parseCommands(commands);
+  if (randomize) {
+    if (!cmd.size) cmd.size = chance(cfg.bigPct) ? 'big' : chance(cfg.smallPct) ? 'small' : 'medium';
+    if (!cmd.color && chance(cfg.colorPct)) cmd.color = COLORS[pick(RANDOM_COLORS)];
+    if (!cmd.pos && chance(cfg.fixedPct)) cmd.pos = Math.random() < 0.5 ? 'ue' : 'shita';
+  }
+  const size = cmd.size || 'medium';
+  const pos = cmd.pos || 'naka';
+  const color = cmd.color || '#FFFFFF';
+  const jitter = randomize ? 1 + rand(-cfg.jitter, cfg.jitter) / 100 : 1;
+  let fontPx = Math.max(8, H * SIZES[size] * cfg.scale * jitter);
+
+  const lines = text.split('\n').slice(0, 12);
+  let r = renderBitmap(lines, fontPx, color);
+  // Fixed comments that don't fit get shrunk to the screen width, like Niconico does.
+  if (pos !== 'naka' && r.w > W) {
+    fontPx *= W / r.w;
+    r = renderBitmap(lines, fontPx, color);
+  }
+
+  const now = performance.now();
+  const dur = (cmd.dur || (pos === 'naka' ? cfg.duration : cfg.fixedDuration)) * 1000;
+  const c = { ...r, pos, start: now, end: now + dur, dur, y: 0 };
+  c.y = placeY(c, now);
+  active[pos].push(c);
+}
+
+/* ------------------------------------------------------------------ *
+ * Placement — Niconico's algorithm: start at the top edge, and every
+ * time we'd collide with an existing comment, drop below it. If we fall
+ * off the bottom, the screen is "full" and we pick a random height.
+ * ------------------------------------------------------------------ */
+const xAt = (c, t) => W - (W + c.w) * ((t - c.start) / c.dur); // left edge of a naka comment
+
+function nakaCollides(a, b, now) {
+  // Both move left linearly, so checking the two endpoints of the shared time window is enough.
+  const tEnd = Math.min(a.end, b.end);
+  if (tEnd <= now) return false;
+  for (const t of [now, tEnd]) {
+    const ax = xAt(a, t), bx = xAt(b, t);
+    if (ax < bx + b.w && bx < ax + a.w) return true;
+  }
+  return false;
+}
+
+function placeY(c, now) {
+  const list = active[c.pos];
+  if (c.h >= H) return 0;
+  let y = 0;
+  for (let guard = 0; guard < 500; guard++) {
+    let moved = false;
+    for (const o of list) {
+      if (o.end <= now) continue;
+      const oy = c.pos === 'shita' ? H - o.y - o.h : o.y; // shita stacks up from the bottom
+      if (y < oy + o.h && oy < y + c.h) {
+        if (c.pos !== 'naka' || nakaCollides(c, o, now)) { y = oy + o.h; moved = true; break; }
+      }
+    }
+    if (!moved) break;
+  }
+  if (y + c.h > H) return Math.random() * (H - c.h); // overflow → random, like the real thing
+  return c.pos === 'shita' ? H - y - c.h : y;
+}
+
+/* ------------------------------------------------------------------ *
+ * Draw loop
+ * ------------------------------------------------------------------ */
+function frame(now) {
+  ctx.clearRect(0, 0, W, H);
+  ctx.globalAlpha = Math.max(0, Math.min(1, cfg.opacity / 100));
+  for (const pos of ['naka', 'ue', 'shita']) {
+    const list = active[pos];
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].end <= now) list.splice(i, 1);
+    for (const c of list) {
+      const x = pos === 'naka' ? xAt(c, now) : (W - c.w) / 2;
+      ctx.drawImage(c.bmp, x, c.y, c.w, c.h);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ------------------------------------------------------------------ *
+ * Source: demo comments
+ * ------------------------------------------------------------------ */
+const rep = (s, a, b) => s.repeat(Math.floor(rand(a, b + 1)));
+const DEMO = [
+  () => rep('w', 3, 14), () => rep('ｗ', 3, 10), () => rep('8', 4, 20), () => '草', () => '草生える',
+  () => 'き' + rep('た', 1, 1) + rep('あ', 3, 14), () => rep('お', 4, 16), () => 'う' + rep('お', 3, 12),
+  () => 'かわいい', () => 'かわいいいいい', () => 'うぽつ', () => 'わこつ', () => '初見です', () => '神',
+  () => '神回', () => 'すげえ', () => 'すごい', () => 'うまい', () => 'うますぎ', () => 'え？', () => 'ええ…',
+  () => 'なんだこれｗｗｗ', () => '鳥肌立った', () => 'いい曲', () => '泣いた', () => 'ここ好き',
+  () => 'ここすき', () => 'ｷﾀ━━━━(ﾟ∀ﾟ)━━━━!!', () => '(ﾟ∀ﾟ)', () => '( ´∀｀)', () => '(´・ω・｀)',
+  () => '職人乙', () => '弾幕薄いよ！何やってんの！', () => 'いえーい', () => 'いえ' + rep('ー', 1, 4) + 'い',
+  () => 'がんばれー', () => 'しっかり見てるからな', () => '見てる' + rep('う', 3, 14), () => 'あれ？',
+  () => '待ってた', () => '天才か', () => 'プロの犯行', () => 'つよい', () => 'やばい', () => 'ｗｗｗｗｗ',
+  () => '888888888888', () => '←', () => '↑↑↑', () => 'ん？', () => 'ファッ!?', () => '今北産業',
+  () => 'おつかれ', () => 'お疲れ様でした', () => 'lol', () => 'GG', () => 'nice', () => 'ok',
+  () => '♪～', () => '～～～～～～', () => '！？', () => 'まじか', () => 'それな', () => '最高',
+];
+const BURSTS = [
+  () => rep('8', 6, 24), () => rep('w', 6, 20), () => 'きた' + rep('あ', 6, 18),
+  () => rep('お', 8, 20), () => 'うぽつ', () => 'おつかれ' + rep('ー', 1, 6), () => rep('ｗ', 5, 15),
+];
+
+let burst = null;
+function demoTick() {
+  if (!cfg.demo) return;
+  const now = performance.now();
+  if (cfg.demoBursts && !burst && Math.random() < 0.002) burst = { gen: pick(BURSTS), until: now + rand(2000, 4500) };
+  if (burst && now > burst.until) burst = null;
+  const rate = cfg.demoRate * (burst ? 5 : 1);
+  // Poisson-ish: expected `rate` comments/sec at a 50ms tick
+  let n = 0, p = rate * 0.05;
+  while (p > 0) { if (Math.random() < Math.min(1, p)) n++; p -= 1; }
+  for (let i = 0; i < n; i++) addComment(burst && Math.random() < 0.8 ? burst.gen() : pick(DEMO)());
+}
+setInterval(demoTick, 50);
+
+/* ------------------------------------------------------------------ *
+ * Chat: shared message handler (supports "[big red ue] text")
+ * ------------------------------------------------------------------ */
+function onChat(user, text, commands = '') {
+  if (user && ignored.has(String(user).toLowerCase().replace(/^@/, ''))) return;
+  if (cfg.viewerCommands) {
+    const m = /^\s*\[([^\]]{1,60})\]\s*(.*)$/s.exec(text);
+    if (m) { commands = (commands + ' ' + m[1]).trim(); text = m[2]; }
+  } else {
+    commands = '';
+  }
+  addComment(text, commands);
+}
+
+/* Twitch chat via anonymous IRC-over-WebSocket (read-only, no login needed) */
+function connectTwitch(channel) {
+  channel = channel.replace(/^#/, '').trim().toLowerCase();
+  if (!channel) return;
+  let backoff = 1000;
+  const open = () => {
+    const ws = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+    ws.onopen = () => {
+      backoff = 1000;
+      ws.send('CAP REQ :twitch.tv/tags');
+      ws.send('PASS SCHMOOPIIE');
+      ws.send('NICK justinfan' + Math.floor(rand(10000, 99999)));
+      ws.send('JOIN #' + channel);
+      console.log('[nico] connected to Twitch #' + channel);
+    };
+    ws.onmessage = ev => {
+      for (const line of String(ev.data).split('\r\n')) {
+        if (!line) continue;
+        if (line.startsWith('PING')) { ws.send('PONG :tmi.twitch.tv'); continue; }
+        const m = /^(?:@(\S+) )?:([^!\s]+)!\S+ PRIVMSG #\S+ :(.*)$/.exec(line);
+        if (!m) continue;
+        let msg = m[3];
+        const action = /^\x01ACTION (.*)\x01$/.exec(msg);
+        if (action) msg = action[1];
+        onChat(m[2], msg);
+      }
+    };
+    ws.onclose = () => { setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000); };
+    ws.onerror = () => ws.close();
+  };
+  open();
+}
+
+/* Generic WebSocket: plain text, or JSON like {"text": "...", "commands": "big red", "user": "..."} */
+function connectGenericWs(url) {
+  let backoff = 1000;
+  const open = () => {
+    let ws;
+    try { ws = new WebSocket(url); } catch (e) { console.error('[nico] bad ws url', e); return; }
+    ws.onopen = () => { backoff = 1000; console.log('[nico] connected to', url); };
+    ws.onmessage = ev => {
+      let data = ev.data;
+      try { data = JSON.parse(data); } catch { /* plain text */ }
+      if (typeof data === 'string') return onChat('', data);
+      if (data && typeof data === 'object') {
+        const text = data.text ?? data.message ?? data.chatmessage ?? data.comment ?? '';
+        const commands = data.commands ?? data.mail ?? data.command ?? '';
+        onChat(data.user ?? data.name ?? data.chatname ?? '', String(text), String(commands));
+      }
+    };
+    ws.onclose = () => { setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000); };
+    ws.onerror = () => ws.close();
+  };
+  open();
+}
+
+/* YouTube: polls the local youtube-chat.ps1 bridge (YouTube can't be read from the page directly) */
+function connectYouTube(port) {
+  let after = -1, session = null, lastStatus = '';
+  const tick = async () => {
+    try {
+      const r = await fetch(`http://localhost:${port}/chat?after=${after}`, { cache: 'no-store' });
+      const d = await r.json();
+      if (d.status !== lastStatus) { lastStatus = d.status; console.log('[nico] YouTube chat:', d.status, d.video || ''); }
+      if (d.session !== session) {
+        session = d.session; // bridge (re)started: pick up from its current position
+      } else {
+        // PowerShell's JSON writer can emit {} or a bare object instead of an array
+        const msgs = Array.isArray(d.messages) ? d.messages : (d.messages && d.messages.text ? [d.messages] : []);
+        for (const m of msgs) onChat(m.user, m.text);
+      }
+      after = d.last;
+    } catch { /* bridge not running yet */ }
+    setTimeout(tick, 1000);
+  };
+  tick();
+}
+
+/* Kick chat: public Pusher websocket. Kick hands out the key per session via an API that only
+   answers kick.com itself, so we fall back to the key it currently uses. */
+const KICK_PUSHER = { key: '34bf7a0ff419a2a775b9', cluster: 'us2' };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function connectKick(input) {
+  const slug = String(input).trim().replace(/^.*kick\.com\//i, '').replace(/[/?#].*$/, '').toLowerCase();
+  if (!slug) return;
+  let room = /^\d+$/.test(slug) ? +slug : 0, channelId = 0;
+  while (!room) {
+    try {
+      const r = await fetch(`https://kick.com/api/v2/channels/${encodeURIComponent(slug)}`, { headers: { Accept: 'application/json' } });
+      const j = await r.json();
+      room = j.chatroom.id; channelId = j.id;
+    } catch (e) {
+      console.warn('[nico] Kick channel lookup failed (retrying in 15s). Enter the chatroom id instead if this keeps failing.', e);
+      await sleep(15000);
+    }
+  }
+
+  let app = KICK_PUSHER;
+  if (channelId) {
+    try {
+      const r = await fetch(`https://web.kick.com/api/v1/realtime/channels/${channelId}/chat/connection`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client: { id: crypto.randomUUID(), type: 'web' },
+                               capabilities: { accepted_providers: [{ provider: 'pusher' }] } }),
+      });
+      const c = (await r.json()).data.connections.find(x => x.provider === 'pusher');
+      if (c) app = { key: c.credentials.app_key, cluster: c.credentials.cluster };
+    } catch { /* not allowed from outside kick.com; use the default */ }
+  }
+
+  let backoff = 1000;
+  const open = () => {
+    const ws = new WebSocket(`wss://ws-${app.cluster}.pusher.com/app/${app.key}?protocol=7&client=js&version=8.4.0&flash=false`);
+    ws.onopen = () => {
+      backoff = 1000;
+      ws.send(JSON.stringify({ event: 'pusher:subscribe', data: { auth: '', channel: `chatrooms.${room}.v2` } }));
+      console.log('[nico] connected to Kick chatroom', room);
+    };
+    ws.onmessage = ev => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.event === 'pusher:ping') return ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
+      if (m.event === 'pusher:error') return console.warn('[nico] Kick:', m.data);
+      if (m.event !== 'App\\Events\\ChatMessageEvent') return;
+      let d; try { d = typeof m.data === 'string' ? JSON.parse(m.data) : m.data; } catch { return; }
+      // Emotes arrive as [emote:123:name]; show the name (and keep them from looking like [commands])
+      const text = String(d.content || '').replace(/\[emote:\d+:([^\]]*)\]/g, '$1');
+      onChat(d.sender && d.sender.username, text);
+    };
+    ws.onclose = () => { setTimeout(open, backoff); backoff = Math.min(backoff * 2, 30000); };
+    ws.onerror = () => ws.close();
+  };
+  open();
+}
+
+if (cfg.twitch) connectTwitch(String(cfg.twitch));
+if (cfg.kick) connectKick(cfg.kick);
+if (cfg.youtube) connectYouTube(cfg.youtubePort);
+if (cfg.ws) connectGenericWs(String(cfg.ws));
+
+/* ------------------------------------------------------------------ *
+ * Manual posting: press Enter (in OBS: right-click source → Interact)
+ * ------------------------------------------------------------------ */
+const post = document.getElementById('post');
+const cmdIn = document.getElementById('cmd');
+const txtIn = document.getElementById('txt');
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !post.classList.contains('open')) { post.classList.add('open'); txtIn.focus(); e.preventDefault(); }
+  else if (e.key === 'Escape') { post.classList.remove('open'); txtIn.blur(); cmdIn.blur(); }
+});
+for (const el of [cmdIn, txtIn]) el.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.stopPropagation(); e.preventDefault();
+  if (txtIn.value.trim()) addComment(txtIn.value, cmdIn.value, { randomize: !cmdIn.value.trim() });
+  txtIn.value = '';
+});
+
+window.nico = { addComment, cfg, connectKick }; // handy for testing from devtools
+})();
+</script>
+</body>
+</html>
