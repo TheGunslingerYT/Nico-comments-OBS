@@ -29,7 +29,9 @@ whatever scene is live, without the comments, and a Source Record filter records
 | While streaming or recording | Either of the above. |
 
 **Replay buffer:** while the toggle is on, starting OBS's replay buffer also starts a clean one of the same
-length. Every time you save a replay, a `Replay … (no comments)` file is saved next to the normal one.
+length. Every time you save a replay, a `Replay … (no comments)` file is saved in the same folder.
+With **Only keep comment-free replays** ticked (the default), the normal replay with comments is deleted
+once the clean one has finished saving. If the clean replay fails to save, the normal one is kept.
 Each buffer keeps its footage in RAM, so expect about twice the replay buffer memory use.
 
 Clean files go in your normal OBS recording folder. To change the folder, encoder or format, open

@@ -151,6 +151,7 @@ if ffi_ok then
   pcall(ffi.cdef, [[
     int MultiByteToWideChar(unsigned int cp, unsigned long flags, const char *str, int cb, wchar_t *wstr, int cch);
     void *ShellExecuteW(void *hwnd, const wchar_t *op, const wchar_t *file, const wchar_t *params, const wchar_t *dir, int show);
+    int DeleteFileW(const wchar_t *path);
   ]])
   local ok, lib = pcall(ffi.load, "shell32")
   if ok then shell32 = lib end
@@ -413,12 +414,44 @@ local function apply_clean_mode()
   obs.obs_source_release(feed)
 end
 
+-- Normal replay (with comments) waiting for its clean copy to finish writing before it's deleted.
+local pending_delete = nil
+
+local function delete_file(path)
+  if ffi_ok then -- wide API so non-ASCII paths work
+    local ok, r = pcall(function() return ffi.C.DeleteFileW(wide(path)) end)
+    if ok then return r ~= 0 end
+  end
+  return os.remove(path) ~= nil
+end
+
+-- Runs on the muxer thread once the clean replay file is fully written.
+local function on_clean_replay_saved(cd)
+  local path = pending_delete
+  pending_delete = nil
+  if path == nil then return end
+  if delete_file(path) then
+    log("Deleted replay with comments: " .. path)
+  else
+    warn("Couldn't delete replay with comments: " .. path)
+  end
+end
+
 -- When OBS saves a replay, save the matching comment-free one too.
 local function save_clean_replay()
   local out = obs.obs_get_output_by_name(CLEAN_REPLAY_OUTPUT)
   if out == nil then
     warn("Clean replay buffer isn't running, so no comment-free replay was saved.")
     return
+  end
+  -- Only delete the normal replay after the clean one has saved, so a failed save never loses the clip.
+  pending_delete = nil
+  if obs.obs_data_get_bool(settings_ref, "delete_comment_replays") then
+    local last = obs.obs_frontend_get_last_replay()
+    if last ~= nil and last ~= "" then pending_delete = last end
+    local sh = obs.obs_output_get_signal_handler(out)
+    obs.signal_handler_disconnect(sh, "saved", on_clean_replay_saved) -- keep exactly one connection
+    obs.signal_handler_connect(sh, "saved", on_clean_replay_saved)
   end
   local cd = obs.calldata_create()
   obs.proc_handler_call(obs.obs_output_get_proc_handler(out), "save", cd)
@@ -496,6 +529,8 @@ function script_properties()
   obs.obs_property_list_add_int(when, "When I press Start Recording", MODE_RECORDING)
   obs.obs_property_list_add_int(when, "Automatically while I'm streaming", MODE_STREAMING)
   obs.obs_property_list_add_int(when, "While streaming or recording", MODE_EITHER)
+  obs.obs_properties_add_bool(p, "delete_comment_replays",
+    "Only keep comment-free replays (delete the replay with comments)")
 
   obs.obs_properties_add_button(p, "apply", "Apply settings (reload comments)", function()
     reload_overlay(); start_youtube_bridge(); return false
@@ -537,6 +572,7 @@ function script_defaults(s)
   obs.obs_data_set_default_string(s, "hide_scenes", "")
   obs.obs_data_set_default_bool(s, "clean_enabled", false)
   obs.obs_data_set_default_int(s, "clean_when", MODE_RECORDING)
+  obs.obs_data_set_default_bool(s, "delete_comment_replays", true)
   obs.obs_data_set_default_bool(s, "demo", true)
   obs.obs_data_set_default_double(s, "demo_rate", 4)
   obs.obs_data_set_default_bool(s, "demo_bursts", true)
